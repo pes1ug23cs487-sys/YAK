@@ -219,6 +219,7 @@ class ConsumerClient:
         
         print("\nStarting consumer poll loop... (Press Ctrl+C to stop)")
         try:
+            # Start the main poll loop
             while True:
                 self.consume_messages()
                 # Poll every 3 seconds
