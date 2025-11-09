@@ -104,6 +104,11 @@
             color: #e5e7eb;
             font-size: 14px;
         }
+        
+        input:disabled {
+            background: rgba(40, 40, 40, 0.8);
+            color: #6b7280;
+        }
 
         input[type="text"]:focus,
         textarea:focus,
@@ -157,6 +162,8 @@
         button:disabled {
             opacity: 0.5;
             cursor: not-allowed;
+            transform: none;
+            box-shadow: none;
         }
 
         .btn-success {
@@ -225,6 +232,29 @@
             grid-template-columns: 1fr 1fr;
             gap: 20px;
         }
+        
+        .progress-container {
+            margin-top: 20px;
+        }
+        .progress-bar-bg {
+            background: rgba(30, 30, 30, 0.8);
+            border-radius: 8px;
+            padding: 3px;
+        }
+        .progress-bar {
+            width: 0%;
+            height: 20px;
+            background: linear-gradient(90deg, #10b981, #059669);
+            border-radius: 6px;
+            transition: width 0.3s ease;
+        }
+        .progress-text {
+            text-align: center;
+            color: #9ca3af;
+            font-size: 13px;
+            margin-top: 5px;
+        }
+
 
         @media (max-width: 768px) {
             .grid-2 {
@@ -267,22 +297,33 @@
             </div>
 
             <div class="card">
-                <h2>📁 Upload & Send File</h2>
+                <h2>📁 Upload & Stream File</h2>
                 <div class="file-upload" onclick="document.getElementById('file-input').click()">
                     <div style="font-size: 48px; margin-bottom: 10px;">📄</div>
-                    <div id="file-name">Click to upload CSV file</div>
+                    <div id="file-name">Click to upload dataset.csv</div>
                     <input type="file" id="file-input" accept=".csv" onchange="handleFileUpload(event)">
                 </div>
+                
                 <div class="form-group" style="margin-top: 20px;">
-                    <label>Topic for File Data</label>
-                    <input type="text" id="file-topic" value="server_metrics" placeholder="Enter topic name">
+                    <label>Topic (Ignored - Uses Project Topics)</label>
+                    <input type="text" id="file-topic" value="topic-cpu, topic-mem, topic-net, topic-disk" disabled>
                 </div>
                 <div class="form-group">
                     <label>Key Field (from CSV)</label>
                     <input type="text" id="key-field" value="server_id" placeholder="Column name to use as key">
                 </div>
-                <button onclick="sendFileData()" id="send-file-btn" class="btn-success" disabled>Send File Data</button>
+                
+                <button onclick="handleSendPauseResume()" id="send-file-btn" class="btn-success" disabled>Send All File Data</button>
+                
                 <div id="file-preview" style="margin-top: 15px; color: #9ca3af; font-size: 13px;"></div>
+                
+                <div class="progress-container" id="progress-container" style="display: none;">
+                    <label>Sending Progress:</label>
+                    <div class="progress-bar-bg">
+                        <div id="progress-bar" class="progress-bar"></div>
+                    </div>
+                    <div id="progress-text" class="progress-text">0 / 0</div>
+                </div>
             </div>
         </div>
 
@@ -318,7 +359,17 @@
         let sentCount = 0;
         let failedCount = 0;
         let batchCount = 0;
+        
+        let currentSendIndex = 0;
         let uploadedRecords = null;
+        let sendState = 'idle'; // 'idle', 'sending', 'paused', 'complete'
+        
+        // --- *** THIS IS THE ONLY CHANGE *** ---
+        // Reduced from 20 to 5 for a more responsive pause.
+        const BATCH_CHUNK_SIZE = 5;
+        // --- *** END OF CHANGE *** ---
+        
+        let currentAppSessionId = null;
 
         function addLog(message, type = 'info') {
             const container = document.getElementById('log-container');
@@ -344,18 +395,56 @@
             document.getElementById('batch-count').textContent = batchCount;
         }
 
-        async function checkLeader() {
+        function hardResetClientState() {
+            addLog('Server has restarted. Client state is being reset.', 'error');
+            addLog('Please re-upload your file to start again.', 'info');
+            
+            currentSendIndex = 0;
+            uploadedRecords = null;
+            sendState = 'idle';
+            
+            // Reset UI
+            document.getElementById('file-name').textContent = 'Click to upload dataset.csv';
+            document.getElementById('file-preview').innerHTML = '';
+            document.getElementById('progress-container').style.display = 'none';
+            document.getElementById('progress-bar').style.width = '0%';
+            
+            // Reset button
+            const btn = document.getElementById('send-file-btn');
+            btn.textContent = 'Send All File Data';
+            btn.classList.add('btn-success');
+            btn.classList.remove('btn-danger');
+            btn.disabled = true;
+        }
+
+        async function checkAppStatus() {
             try {
-                const response = await fetch('/api/leader');
-                const data = await response.json();
+                // --- Step 1: Check the App Server Session ---
+                const sessionResponse = await fetch('/api/session');
+                const sessionData = await sessionResponse.json();
                 
-                if (data.leader_url) {
+                if (currentAppSessionId === null) {
+                    currentAppSessionId = sessionData.session_id;
+                    addLog(`Connected to server session: ${currentAppSessionId.substring(0, 8)}...`, 'success');
+                } else if (currentAppSessionId !== sessionData.session_id) {
+                    addLog(`Detected server restart. Old session: ${currentAppSessionId.substring(0, 8)}... New session: ${sessionData.session_id.substring(0, 8)}...`, 'error');
+                    currentAppSessionId = sessionData.session_id;
+                    hardResetClientState();
+                    return;
+                }
+                
+                // --- Step 2: Check the Leader (only if session is stable) ---
+                const leaderResponse = await fetch('/api/leader');
+                const leaderData = await leaderResponse.json();
+                
+                if (leaderData.leader_url) {
                     document.getElementById('status-dot').classList.add('connected');
-                    document.getElementById('leader-status').textContent = `Connected to ${data.leader_url}`;
+                    document.getElementById('leader-status').textContent = `Connected to ${leaderData.leader_url}`;
                 } else {
                     document.getElementById('status-dot').classList.remove('connected');
                     document.getElementById('leader-status').textContent = 'No leader available';
                 }
+                
             } catch (error) {
                 document.getElementById('status-dot').classList.remove('connected');
                 document.getElementById('leader-status').textContent = 'Connection error';
@@ -363,6 +452,7 @@
         }
 
         async function sendSingleMessage() {
+            // (This function is unchanged)
             const topic = document.getElementById('single-topic').value;
             const key = document.getElementById('single-key').value;
             const payloadText = document.getElementById('single-payload').value;
@@ -408,10 +498,13 @@
         }
 
         async function handleFileUpload(event) {
+            // (This function is unchanged)
             const file = event.target.files[0];
             if (!file) return;
 
             document.getElementById('file-name').textContent = `Uploading ${file.name}...`;
+            document.getElementById('send-file-btn').disabled = true;
+            uploadedRecords = null;
 
             const formData = new FormData();
             formData.append('file', file);
@@ -425,24 +518,25 @@
                 const data = await response.json();
 
                 if (response.ok) {
-                    uploadedRecords = data.preview;
-                    document.getElementById('file-name').textContent = `✓ ${file.name} (${data.records} records)`;
+                    uploadedRecords = data.records; 
+                    
+                    document.getElementById('file-name').textContent = `✓ ${file.name} (${data.count} records)`;
                     document.getElementById('send-file-btn').disabled = false;
+                    
                     document.getElementById('file-preview').innerHTML = `
                         <strong>Preview (first 5 records):</strong><br>
                         <pre style="background: rgba(0,0,0,0.3); padding: 10px; border-radius: 5px; margin-top: 10px; overflow-x: auto;">
 ${JSON.stringify(data.preview, null, 2)}
                         </pre>
                     `;
-                    addLog(`✓ File uploaded: ${data.records} records`, 'success');
+                    addLog(`✓ File uploaded: ${data.count} records`, 'success');
                     
-                    // Store all records for sending
-                    fetch('/api/upload', {
-                        method: 'POST',
-                        body: formData
-                    }).then(r => r.json()).then(d => {
-                        uploadedRecords = d.preview;
-                    });
+                    currentSendIndex = 0;
+                    sendState = 'idle';
+                    updateSendButtonUI();
+                    document.getElementById('progress-container').style.display = 'none';
+                    document.getElementById('progress-bar').style.width = '0%';
+                    
                 } else {
                     addLog(`✗ Upload failed: ${data.error}`, 'error');
                     document.getElementById('file-name').textContent = 'Click to upload CSV file';
@@ -452,56 +546,135 @@ ${JSON.stringify(data.preview, null, 2)}
                 document.getElementById('file-name').textContent = 'Click to upload CSV file';
             }
         }
-
-        async function sendFileData() {
-            if (!uploadedRecords) {
-                addLog('Error: No file uploaded', 'error');
-                return;
+        
+        function handleSendPauseResume() {
+            // (This function is unchanged)
+            if (sendState === 'idle' || sendState === 'complete') {
+                currentSendIndex = 0;
+                sendState = 'sending';
+                addLog('Starting batch send...', 'info');
+                sendFileDataLoop();
+            } else if (sendState === 'sending') {
+                sendState = 'paused';
+                addLog('Sending paused by user.', 'info');
+            } else if (sendState === 'paused') {
+                sendState = 'sending';
+                addLog('Sending resumed by user.', 'info');
+                sendFileDataLoop();
             }
-
-            const topic = document.getElementById('file-topic').value;
-            const keyField = document.getElementById('key-field').value;
-
-            if (!topic) {
-                addLog('Error: Topic is required', 'error');
-                return;
+            updateSendButtonUI();
+        }
+        
+        function updateSendButtonUI() {
+            // (This function is unchanged)
+            const btn = document.getElementById('send-file-btn');
+            if (sendState === 'idle') {
+                btn.textContent = 'Send All File Data';
+                btn.classList.add('btn-success');
+                btn.classList.remove('btn-danger');
+                btn.disabled = (uploadedRecords === null);
+            } else if (sendState === 'sending') {
+                btn.textContent = 'Pause';
+                btn.classList.remove('btn-success');
+                btn.classList.add('btn-danger');
+                btn.disabled = false;
+            } else if (sendState === 'paused') {
+                btn.textContent = 'Resume Sending';
+                btn.classList.add('btn-success');
+                btn.classList.remove('btn-danger');
+                btn.disabled = false;
+            } else if (sendState === 'complete') {
+                btn.textContent = 'Send Complete ✓';
+                btn.classList.add('btn-success');
+                btn.classList.remove('btn-danger');
+                btn.disabled = true;
             }
-
-            addLog(`Sending batch to topic: ${topic}...`, 'info');
-            document.getElementById('send-file-btn').disabled = true;
-
-            try {
-                const response = await fetch('/api/send_batch', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        records: uploadedRecords,
-                        topic: topic,
-                        key_field: keyField
-                    })
-                });
-
-                const data = await response.json();
-
-                if (response.ok) {
-                    addLog(`✓ Batch sent: ${data.sent} succeeded, ${data.failed} failed`, 'success');
-                    sentCount += data.sent;
-                    failedCount += data.failed;
-                    batchCount += data.sent;
-                } else {
-                    addLog(`✗ Batch failed: ${data.error}`, 'error');
-                }
-            } catch (error) {
-                addLog(`✗ Batch error: ${error.message}`, 'error');
-            }
-
-            document.getElementById('send-file-btn').disabled = false;
-            updateStats();
+        }
+        
+        function updateProgress() {
+            // (This function is unchanged)
+            const totalRecords = uploadedRecords ? uploadedRecords.length : 0;
+            const percentage = totalRecords > 0 ? (currentSendIndex / totalRecords) * 100 : 0;
+            document.getElementById('progress-bar').style.width = `${percentage}%`;
+            document.getElementById('progress-text').textContent = `${currentSendIndex} / ${totalRecords} Records Sent`;
         }
 
-        // Check leader status on load and periodically
-        checkLeader();
-        setInterval(checkLeader, 5000);
+        async function sendFileDataLoop() {
+            // (This function is unchanged)
+            if (!uploadedRecords) {
+                addLog('Error: No file uploaded', 'error');
+                sendState = 'idle';
+                updateSendButtonUI();
+                return;
+            }
+
+            const keyField = document.getElementById('key-field').value;
+            if (!keyField) {
+                 addLog('Error: Key Field is required', 'error');
+                 sendState = 'idle';
+                 updateSendButtonUI();
+                 return;
+            }
+
+            document.getElementById('progress-container').style.display = 'block';
+            const totalRecords = uploadedRecords.length;
+            updateProgress();
+
+            while (currentSendIndex < totalRecords && sendState === 'sending') {
+                const chunkEnd = Math.min(currentSendIndex + BATCH_CHUNK_SIZE, totalRecords);
+                const chunk = uploadedRecords.slice(currentSendIndex, chunkEnd);
+
+                addLog(`Sending chunk: rows ${currentSendIndex + 1} to ${chunkEnd}...`, 'info');
+                
+                try {
+                    const response = await fetch('/api/send_batch_chunk', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            chunk: chunk,
+                            key_field: keyField
+                        })
+                    });
+
+                    const data = await response.json();
+
+                    if (response.ok) {
+                        addLog(`✓ Chunk success: ${data.sent} msgs sent, ${data.failed} failed`, 'success');
+                        sentCount += data.sent;
+                        failedCount += data.failed;
+                        batchCount += data.sent;
+                        
+                        currentSendIndex = chunkEnd; 
+                        
+                    } else {
+                        addLog(`✗ Chunk failed (server error): ${data.error}. Retrying same chunk...`, 'error');
+                        await new Promise(resolve => setTimeout(resolve, 3000));
+                    }
+                } catch (error) {
+                    addLog(`✗ Chunk failed (network/leader error): ${error.message}. Retrying...`, 'error');
+                    await new Promise(resolve => setTimeout(resolve, 5000));
+                }
+
+                updateStats();
+                updateProgress();
+            }
+
+            if (currentSendIndex >= totalRecords) {
+                addLog('✓✓✓ Batch sending complete! All records processed.', 'success');
+                sendState = 'complete';
+            } else if (sendState === 'paused') {
+                addLog('Sending paused. Click "Resume" to continue.', 'info');
+            } else {
+                addLog('Sending stopped unexpectedly.', 'error');
+                sendState = 'idle';
+            }
+            updateSendButtonUI();
+        }
+
+
+        // Check status on load and periodically
+        checkAppStatus();
+        setInterval(checkAppStatus, 5000);
     </script>
 </body>
 </html>

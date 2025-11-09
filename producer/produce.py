@@ -2,24 +2,21 @@ import requests
 import time
 import logging
 import sys
-import uuid
-import pandas as pd  # <-- Import pandas
-import itertools   # <-- Import itertools to cycle the dataset
-import json        # <-- Import json for proper data handling
 
 # --- Configuration ---
+# !!! IMPORTANT !!!
+# These MUST be the ZeroTier IPs. 'localhost' will not work.
+# The producer teammate must edit these.
 BROKER_URLS = [
-    "http://localhost:5001", 
+    "http://192.168.191.203:5001",
     "http://192.168.191.242:5002"
 ]
 
-DATASET_FILE = 'dataset (1).csv' # <-- Path to your dataset
-
-# --- New Topic and Alert Configuration ---
-TOPIC_METRICS = "server_metrics"
-TOPIC_ALERTS = "system_alerts"
-CPU_ALERT_THRESHOLD = 90.0 # Alert if CPU usage is over 90%
-
+# Topic Configuration (Kept for the web server to import)
+TOPIC_CPU = "topic-cpu"
+TOPIC_MEM = "topic-mem"
+TOPIC_NET = "topic-net"
+TOPIC_DISK = "topic-disk"
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -29,7 +26,6 @@ class Producer:
     """
     An intelligent producer for YAK (Yet Another Kafka) that handles
     leader discovery and automatic failover.
-    (This class is 100% UNCHANGED from your file)
     """
     def __init__(self, broker_urls):
         self.broker_urls = broker_urls
@@ -37,6 +33,7 @@ class Producer:
         self.session = requests.Session()
         self.session.headers.update({"Content-Type": "application/json"})
         logger.info(f"Producer initialized with brokers: {broker_urls}")
+        self.discover_leader()
 
     def _get_leader_id(self):
         for broker_url in self.broker_urls:
@@ -77,11 +74,20 @@ class Producer:
         if leader_id:
             return self._find_leader_url_by_id(leader_id)
         logger.error("Leader discovery failed.")
+        self.current_leader_url = None
         return False
 
-    def send(self, message_data, max_retries=3):
+    def send(self, msg_id, message_data, max_retries=3):
+        """
+        Sends a message with a PRE-DEFINED msg_id for idempotence.
+        
+        :param msg_id: A unique, deterministic ID for this message.
+        :param message_data: The dict {"topic": ..., "key": ..., "payload": ...}
+        :param max_retries: Number of retries on failure.
+        """
+        
         payload = {
-            "msg_id": str(uuid.uuid4()),
+            "msg_id": str(msg_id), # We use the provided msg_id
             "data": message_data
         }
         
@@ -95,19 +101,22 @@ class Producer:
                 
                 response = self.session.post(
                     f"{self.current_leader_url}/produce",
-                    json=payload, # requests handles the dict -> json bytes
+                    json=payload,
                     timeout=5
                 )
 
                 if response.status_code == 200:
-                    logger.info(f"Successfully sent message. Offset: {response.json().get('offset')}")
                     return response.json()
                 
-                elif response.status_code == 307:
-                    leader_id = response.json().get("leader_id")
-                    logger.warning(f"Broker {self.current_leader_url} is not leader. New leader is {leader_id}.")
-                    self._find_leader_url_by_id(leader_id)
-                    
+                elif response.status_code == 307 or response.status_code == 400:
+                    if "leader_id" in response.json():
+                        leader_id = response.json().get("leader_id")
+                        logger.warning(f"Broker {self.current_leader_url} is not leader. New leader is {leader_id}.")
+                        self._find_leader_url_by_id(leader_id)
+                    else:
+                        logger.error(f"Broker error: {response.text}")
+                        time.sleep(1)
+                        
                 elif response.status_code == 503:
                     logger.warning("Broker reports 503 Service Unavailable (no leader). Retrying...")
                     time.sleep(2)
@@ -125,91 +134,3 @@ class Producer:
             time.sleep(1)
 
         raise Exception(f"Failed to send message after {max_retries} retries.")
-
-# --- Main execution (MODIFIED to read from CSV) ---
-if __name__ == "__main__":
-    logger.info("Starting YAK Producer...")
-    
-    producer = Producer(broker_urls=BROKER_URLS)
-    
-    # Discover the leader at startup
-    while not producer.discover_leader():
-        logger.info("Waiting for a leader to be elected...")
-        time.sleep(3)
-    
-    logger.info(f"Initial leader found: {producer.current_leader_url}")
-    
-    logger.info(f"Reading dataset from {DATASET_FILE}...")
-    try:
-        # Read the entire CSV into memory.
-        # This is fine for this dataset, but for huge files, you'd read in chunks.
-        df = pd.read_csv(DATASET_FILE)
-        # Convert dataframe to a list of dictionaries (one per row)
-        records = df.to_dict('records')
-        logger.info(f"Successfully loaded {len(records)} records. Starting infinite stream...")
-        
-        # Use itertools.cycle to loop over the dataset forever
-        record_stream = itertools.cycle(records)
-        
-    except FileNotFoundError:
-        logger.error(f"FATAL: Dataset file not found at {DATASET_FILE}")
-        sys.exit(1)
-    except Exception as e:
-        logger.error(f"FATAL: Failed to read CSV: {e}")
-        sys.exit(1)
-
-    # --- This is the new streaming loop ---
-    try:
-        for row in record_stream:
-            # `row` is now a dictionary like:
-            # {'ts': '20:53:00', 'server_id': 'server_1', 'cpu_pct': 63.34, ...}
-            
-            # --- This is your "Topic" and "Key" logic ---
-            key = row.get('server_id')
-            topic = TOPIC_METRICS # Default topic
-            
-            # Create the final message payload
-            message = {
-                "topic": topic,
-                "key": key,
-                "payload": row  # Send the full CSV row as the payload
-            }
-            
-            # --- Logic to create a "variety of topics" ---
-            # Also send a separate "alert" message if CPU is high
-            try:
-                if float(row.get('cpu_pct', 0)) > CPU_ALERT_THRESHOLD:
-                    topic = TOPIC_ALERTS
-                    logger.warning(f"HIGH CPU DETECTED on {key}! Sending to {topic} topic.")
-                    
-                    alert_message = {
-                        "topic": topic,
-                        "key": key,
-                        "payload": {
-                            "server": key,
-                            "alert_type": "HIGH_CPU",
-                            "cpu_value": row.get('cpu_pct'),
-                            "timestamp": row.get('ts')
-                        }
-                    }
-                    # Send the alert
-                    producer.send(alert_message)
-                    
-            except Exception as e:
-                logger.error(f"Error processing alert logic: {e}")
-
-            # --- Send the main metrics message ---
-            logger.info(f"Sending event (Topic: {message['topic']}, Key: {message['key']})...")
-            try:
-                result = producer.send(message)
-                
-            except Exception as e:
-                logger.error(f"Failed to send message: {e}")
-                logger.error("Producer will keep trying...")
-            
-            # Stream one record every 0.5 seconds
-            time.sleep(0.5) 
-
-    except KeyboardInterrupt:
-        logger.info("\nStopping producer...")
-        sys.exit(0)
